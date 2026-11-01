@@ -26,6 +26,16 @@ cd ufw_accesser
 sudo ./setup.sh
 ```
 
+## Запуск по одной команде
+
+Установить и настроить UFW можно прямо сейчас — одна команда:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tutkis/ufw_accesser/main/setup.sh | sudo bash
+```
+
+`curl -fsSL` обеспечивает проверку кода, сжатое скачивание и тихий режим (ошибки выводятся явно).
+
 `setup.sh` устанавливает зависимости (`ufw`, `openssh-server`, `dnsutils`),
 создаёт каталог `/opt/accesser`, генерирует шаблон `/opt/accesser/rules` и
 скрипт обновления `/opt/accesser/update.sh`, запускает первоначальную
