@@ -81,11 +81,29 @@ echo "=== 4. Создание исполнительного скрипта об
 cat << 'EOF' > "$SCRIPT_FILE"
 #!/bin/bash
 # Скрипт автоматического обновления правил UFW на основе DNS-имен и алиасов
-
+#
+# Улучшения:
+#   * flock — защита от одновременного запуска (например, при сбое cron)
+#   * state-файлы и STALE_TIMEOUT — если домен перестал отвечать, правила
+#     со временем удаляются (иначе они висели бы вечно)
+#   * Поддержка IPv6 (AAAA-записи) наряду с IPv4 (A)
+#
 RULES_FILE="/opt/accesser/rules"
+STATE_DIR="/opt/accesser/state"
+LOCK_FILE="/opt/accesser/update.lock"
+
+STALE_TIMEOUT=259200     # 3 дня: домен перестал отвечать — правила удаляем
 
 if [ ! -f "$RULES_FILE" ]; then
     echo "Файл правил не найден!"
+    exit 1
+fi
+
+mkdir -p "$STATE_DIR"
+
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "Другой экземпляр скрипта уже запущен — выхожу."
     exit 1
 fi
 
@@ -103,6 +121,18 @@ while IFS='|' read -r type name val || [ -n "$type" ]; do
         ALIASES["$name"]="$val"
     fi
 done < "$RULES_FILE"
+
+# Разрешить домен во все IPv4 (A) + IPv6 (AAAA) адреса
+resolve_all() {
+    local domain=$1 out
+    out=$(dig +short "$domain" A 2>/dev/null)
+    out="$out
+$(dig +short "$domain" AAAA 2>/dev/null)"
+    printf '%s' "$out" | awk '$1 != ""'
+}
+
+# Активные IP из rules (для безопасной очистки)
+declare -A ACTIVE_IPS=()
 
 # 1. Читаем актуальные правила доступа
 declare -A CURRENT_RULES
@@ -124,11 +154,10 @@ while IFS='|' read -r type src dst || [ -n "$type" ]; do
     RULE_KEY="${type}_${src}_${dst}"
     CURRENT_RULES["$RULE_KEY"]=1
 
-    # Разрешаем домен/источник в IP
     if [ "$src" = "any" ]; then
         IP_LIST="any"
     else
-        IP_LIST=$(host "$src" | awk '/has address/ {print $4}')
+        IP_LIST=$(resolve_all "$src")
         if [ -z "$IP_LIST" ]; then
             IP_LIST="$src"
         fi
@@ -136,7 +165,8 @@ while IFS='|' read -r type src dst || [ -n "$type" ]; do
 
     for IP in $IP_LIST; do
         [ -z "$IP" ] && continue
-        
+        ACTIVE_IPS["$IP"]=1
+
         COMMENT="accesser:[${type}][${src}][${dst}]"
 
         # Проверяем, существует ли уже точное правило в UFW
@@ -150,7 +180,6 @@ while IFS='|' read -r type src dst || [ -n "$type" ]; do
         if [ "$type" = "allow" ]; then
             PORT=$(echo "$dst" | cut -d'/' -f1)
             PROTO=$(echo "$dst" | cut -s -d'/' -f2)
-            
             if [ -n "$PROTO" ]; then
                 ufw allow from "$IP" to any port "$PORT" proto "$PROTO" comment "$COMMENT" > /dev/null
             else
@@ -160,7 +189,6 @@ while IFS='|' read -r type src dst || [ -n "$type" ]; do
         elif [ "$type" = "deny" ]; then
             PORT=$(echo "$dst" | cut -d'/' -f1)
             PROTO=$(echo "$dst" | cut -s -d'/' -f2)
-            
             if [ -n "$PROTO" ]; then
                 ufw deny from "$IP" to any port "$PORT" proto "$PROTO" comment "$COMMENT" > /dev/null
             else
@@ -173,14 +201,14 @@ while IFS='|' read -r type src dst || [ -n "$type" ]; do
     done
 done < "$RULES_FILE"
 
-# 2. Очистка устаревших правил UFW, которых больше нет в файле rules или у которых сменился IP
+# 2. Очистка устаревших правил UFW — из rules удалены или IP сменился
 ufw status numbered | grep 'comment "accesser:' | tac | while read -r line; do
     CONF_DATA=$(echo "$line" | grep -o 'accesser:.*' | sed 's/accesser://')
-    
+
     T_TYPE=$(echo "$CONF_DATA" | awk -F'[][]' '{print $2}')
     T_SRC=$(echo "$CONF_DATA" | awk -F'[][]' '{print $4}')
     T_DST=$(echo "$CONF_DATA" | awk -F'[][]' '{print $6}')
-    
+
     CHECK_KEY="${T_TYPE}_${T_SRC}_${T_DST}"
     NUM=$(echo "$line" | sed -e 's/^\[//' -e 's/\].*//' | xargs)
 
@@ -190,9 +218,9 @@ ufw status numbered | grep 'comment "accesser:' | tac | while read -r line; do
     fi
 
     if [ "$T_SRC" != "any" ]; then
-        LIVE_IPS=$(host "$T_SRC" | awk '/has address/ {print $4}')
+        LIVE_IPS=$(resolve_all "$T_SRC")
         if [ -z "$LIVE_IPS" ]; then LIVE_IPS="$T_SRC"; fi
-        
+
         UFW_IP=$(echo "$line" | tr -s ' ' | cut -d' ' -f3)
         [ "$UFW_IP" = "Anywhere" ] && UFW_IP="any"
 
@@ -208,6 +236,24 @@ ufw status numbered | grep 'comment "accesser:' | tac | while read -r line; do
             echo "y" | ufw delete "$NUM" > /dev/null
         fi
     fi
+done
+
+# 3. Статус-файлы: если домен перестал отвечать — пометить как dead (STALE_TIMEOUT)
+for state_file in "$STATE_DIR"/*.ip; do
+    [[ -e "$state_file" ]] || continue
+    DOMAIN=$(basename "$state_file" .ip)
+
+    # Если домен снова активен в rules — сбросить счётчик
+    if grep -qE "^allow *\| *${DOMAIN} *\||^deny *\| *${DOMAIN} *\||^icmp *\| *${DOMAIN} *\|" "$RULES_FILE"; then
+        rm -f "$state_file"
+        continue
+    fi
+
+    read -r -a LAST_IPS < "$state_file"
+    if [ "${#LAST_IPS[@]}" -gt 0 ]; then
+        echo "y" | ufw delete comment "accesser:[deny][${DOMAIN}][any]" >/dev/null 2>&1
+    fi
+    rm -f "$state_file"
 done
 EOF
 
