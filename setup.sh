@@ -238,10 +238,9 @@ echo "Создан скрипт синхронизации: $SCRIPT_FILE"
 echo "=== 5. Первичный запуск синхронизации ==="
 "$SCRIPT_FILE"
 
-echo "=== 6. Настройка планировщика Cron (каждые 5 минут) ==="
-CRON_CMD="*/5 * * * * /opt/accesser/update.sh > /dev/null 2>&1"
+echo "=== 6. Настройка планировщика Cron (два раза в сутки) ==="
+CRON_CMD="0 */12 * * * /opt/accesser/update.sh > /dev/null 2>&1"
 (crontab -l 2>/dev/null | grep -F -v "$SCRIPT_FILE" ; echo "$CRON_CMD") | crontab -
-
 echo "=== 7. Активация UFW ==="
 # Защита: Проверяем, открылся ли определенный порт SSH из файла правил
 if ! ufw status | grep -E -q "${SSH_PORT}/tcp|${SSH_PORT}.*ALLOW"; then
