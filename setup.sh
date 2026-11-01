@@ -84,22 +84,15 @@ cat << 'EOF' > "$SCRIPT_FILE"
 #
 # Улучшения:
 #   * flock — защита от одновременного запуска (например, при сбое cron)
-#   * state-файлы и STALE_TIMEOUT — если домен перестал отвечать, правила
-#     со временем удаляются (иначе они висели бы вечно)
 #   * Поддержка IPv6 (AAAA-записи) наряду с IPv4 (A)
 #
 RULES_FILE="/opt/accesser/rules"
-STATE_DIR="/opt/accesser/state"
 LOCK_FILE="/opt/accesser/update.lock"
-
-STALE_TIMEOUT=259200     # 3 дня: домен перестал отвечать — правила удаляем
 
 if [ ! -f "$RULES_FILE" ]; then
     echo "Файл правил не найден!"
     exit 1
 fi
-
-mkdir -p "$STATE_DIR"
 
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
@@ -236,24 +229,6 @@ ufw status numbered | grep 'comment "accesser:' | tac | while read -r line; do
             echo "y" | ufw delete "$NUM" > /dev/null
         fi
     fi
-done
-
-# 3. Статус-файлы: если домен перестал отвечать — пометить как dead (STALE_TIMEOUT)
-for state_file in "$STATE_DIR"/*.ip; do
-    [[ -e "$state_file" ]] || continue
-    DOMAIN=$(basename "$state_file" .ip)
-
-    # Если домен снова активен в rules — сбросить счётчик
-    if grep -qE "^allow *\| *${DOMAIN} *\||^deny *\| *${DOMAIN} *\||^icmp *\| *${DOMAIN} *\|" "$RULES_FILE"; then
-        rm -f "$state_file"
-        continue
-    fi
-
-    read -r -a LAST_IPS < "$state_file"
-    if [ "${#LAST_IPS[@]}" -gt 0 ]; then
-        echo "y" | ufw delete comment "accesser:[deny][${DOMAIN}][any]" >/dev/null 2>&1
-    fi
-    rm -f "$state_file"
 done
 EOF
 
